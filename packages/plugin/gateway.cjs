@@ -30,7 +30,7 @@
 
 const http = require('node:http')
 const https = require('node:https')
-const { execFile, spawn } = require('node:child_process')
+const { execFile, execFileSync, spawn } = require('node:child_process')
 const net = require('node:net')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -973,6 +973,440 @@ const HTTP_REQUEST_TIMEOUT_MS = durationEnv('GATEWAY_HTTP_REQUEST_TIMEOUT_MS', 1
 const HTTP_HEADERS_TIMEOUT_MS = durationEnv('GATEWAY_HTTP_HEADERS_TIMEOUT_MS', 120000, 1000, 10 * 60 * 1000)
 const HTTP_KEEPALIVE_TIMEOUT_MS = durationEnv('GATEWAY_HTTP_KEEPALIVE_TIMEOUT_MS', 65000, 1000, 10 * 60 * 1000)
 
+// ---------- Cloudflare 隧道: 随网关启停, 日志留在本进程 ----------
+// 设计目标: 点「启动网关」= 网关 + cloudflared 一起起, 点「停止网关」= 一起停。
+// cloudflared 作为网关的子进程运行, 不注册 Windows 服务, 所以日志能持续被管理页读取。
+const TUNNEL_CONFIG_FILE = process.env.DSH_REMOTE_TUNNEL_CONFIG || path.join(os.homedir(), '.dsh-remote', 'tunnel.json')
+const TUNNEL_LOG_FILE = process.env.DSH_REMOTE_TUNNEL_LOG || path.join(os.homedir(), '.dsh-remote', 'cloudflared.log')
+const TUNNEL_PID_FILE = path.join(path.dirname(TUNNEL_CONFIG_FILE), 'cloudflared.pid')
+const TUNNEL_LOG_MAX_BYTES = 1024 * 1024
+const TUNNEL_LOG_KEEP = 400
+const TUNNEL_RESTART_WINDOW_MS = 5 * 60_000
+const TUNNEL_RESTART_LIMIT = 5
+const tunnelRuntime = {
+  config: null,
+  child: null,
+  status: 'stopped',
+  url: '',
+  startedAt: 0,
+  restartCount: 0,
+  lastError: '',
+  logs: [],
+  seq: 0,
+  attempts: [],
+  restartTimer: null,
+  stopping: false,
+}
+
+function tunnelBadRequest(message) {
+  return Object.assign(new Error(message || 'bad-request'), { status: 400, code: 'bad-request' })
+}
+
+function tunnelText(value, max = 1024) {
+  const text = String(value ?? '')
+  if (text.length > max || /[\0\r\n]/.test(text)) throw tunnelBadRequest('字段超出长度限制或含非法字符')
+  return text
+}
+
+function tunnelHostname(value) {
+  const host = String(value || '').trim().toLowerCase()
+  if (!host) return ''
+  if (host.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*$/.test(host)) throw tunnelBadRequest('主机名格式无效')
+  return host
+}
+
+function tunnelConfigDefaults() {
+  return { enabled: false, mode: 'quick', binary: '', hostname: '', tunnel: '', token: '', protocol: 'auto', extraArgs: [] }
+}
+
+function normalizeTunnelConfig(input, base = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw tunnelBadRequest()
+  const allowed = new Set(['enabled', 'mode', 'binary', 'hostname', 'tunnel', 'token', 'protocol', 'extraArgs'])
+  if (Object.keys(input).some(key => !allowed.has(key))) throw tunnelBadRequest('包含未知字段')
+  const cfg = { ...tunnelConfigDefaults(), ...base }
+  if ('enabled' in input) {
+    if (typeof input.enabled !== 'boolean') throw tunnelBadRequest('enabled 必须是布尔值')
+    cfg.enabled = input.enabled
+  }
+  if ('mode' in input) {
+    if (!['quick', 'named'].includes(input.mode)) throw tunnelBadRequest('mode 只能是 quick 或 named')
+    cfg.mode = input.mode
+  }
+  if ('binary' in input) cfg.binary = tunnelText(input.binary, 1024).trim()
+  if ('hostname' in input) cfg.hostname = tunnelHostname(input.hostname)
+  if ('tunnel' in input) {
+    const name = tunnelText(input.tunnel, 64).trim()
+    if (name && !/^[A-Za-z0-9_-]+$/.test(name)) throw tunnelBadRequest('隧道名只能包含字母、数字、下划线和短横线')
+    cfg.tunnel = name
+  }
+  if ('token' in input) cfg.token = tunnelText(input.token, 4096).trim()
+  if ('protocol' in input) {
+    if (!['auto', 'http2', 'quic'].includes(input.protocol)) throw tunnelBadRequest('protocol 只能是 auto、http2 或 quic')
+    cfg.protocol = input.protocol
+  }
+  if ('extraArgs' in input) {
+    if (!Array.isArray(input.extraArgs) || input.extraArgs.length > 20) throw tunnelBadRequest('extraArgs 必须是最多 20 项的数组')
+    cfg.extraArgs = input.extraArgs.map(item => tunnelText(item, 256))
+  }
+  if (cfg.mode === 'named' && !cfg.token && !cfg.tunnel) throw tunnelBadRequest('命名隧道需要填写隧道名或 Token')
+  return cfg
+}
+
+function loadTunnelConfig(force = false) {
+  if (tunnelRuntime.config && !force) return tunnelRuntime.config
+  let cfg = tunnelConfigDefaults()
+  try {
+    cfg = normalizeTunnelConfig(JSON.parse(fs.readFileSync(TUNNEL_CONFIG_FILE, 'utf8')))
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.error('[tunnel] 配置读取失败, 使用默认值: ' + (error.message || error))
+  }
+  tunnelRuntime.config = cfg
+  return cfg
+}
+
+function saveTunnelConfig(cfg) {
+  fs.mkdirSync(path.dirname(TUNNEL_CONFIG_FILE), { recursive: true, mode: 0o700 })
+  const temp = TUNNEL_CONFIG_FILE + '.' + crypto.randomBytes(4).toString('hex') + '.tmp'
+  try {
+    fs.writeFileSync(temp, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
+    fs.renameSync(temp, TUNNEL_CONFIG_FILE)
+  } finally {
+    try { fs.unlinkSync(temp) } catch {}
+  }
+}
+
+function tunnelBinary(cfg = tunnelRuntime.config || loadTunnelConfig()) {
+  return String(cfg.binary || process.env.DSH_REMOTE_TUNNEL_BIN || process.env.CLOUDFLARED || 'cloudflared').trim()
+}
+
+function tunnelBinaryUsable(binary) {
+  if (!binary) return '未配置 cloudflared 可执行文件'
+  if (path.isAbsolute(binary) || binary.includes('/') || binary.includes('\\')) {
+    try { fs.accessSync(binary, fs.constants.X_OK) } catch { return '找不到可执行的 cloudflared：' + binary }
+  }
+  return ''
+}
+
+function tunnelArgs(cfg) {
+  const args = [...(cfg.extraArgs || []), 'tunnel']
+  if (cfg.protocol === 'http2' || cfg.protocol === 'quic') args.push('--protocol', cfg.protocol)
+  args.push('--no-autoupdate')
+  if (cfg.mode === 'named') {
+    if (cfg.token) args.push('run', '--token', cfg.token)
+    else args.push('run', cfg.tunnel)
+  } else {
+    args.push('--url', `http://127.0.0.1:${PORT}`)
+  }
+  return args
+}
+
+function tunnelRedactedArgs(args, cfg) {
+  return args.map(arg => cfg.token && arg === cfg.token ? '***' : arg)
+}
+
+function tunnelAppend(text, stream = 'stdout') {
+  const line = String(text ?? '').replace(/\r$/, '').replace(/\x1b\[[0-9;]*m/g, '').trimEnd()
+  if (!line) return
+  const row = { n: ++tunnelRuntime.seq, t: Date.now(), stream, text: line.slice(0, 2000) }
+  tunnelRuntime.logs.push(row)
+  if (tunnelRuntime.logs.length > TUNNEL_LOG_KEEP) tunnelRuntime.logs.splice(0, tunnelRuntime.logs.length - TUNNEL_LOG_KEEP)
+  tunnelDetectUrl(line)
+  try {
+    fs.mkdirSync(path.dirname(TUNNEL_LOG_FILE), { recursive: true, mode: 0o700 })
+    try {
+      if (fs.statSync(TUNNEL_LOG_FILE).size > TUNNEL_LOG_MAX_BYTES) fs.renameSync(TUNNEL_LOG_FILE, TUNNEL_LOG_FILE + '.1')
+    } catch {}
+    fs.appendFileSync(TUNNEL_LOG_FILE, `[${new Date(row.t).toISOString()}] ${stream === 'stderr' ? '! ' : ''}${line}\n`, { mode: 0o600 })
+  } catch {}
+}
+
+function tunnelDetectUrl(text) {
+  const cfg = tunnelRuntime.config || loadTunnelConfig()
+  const registered = /Registered tunnel connection|Connection\b.*\bregistered/i.test(text)
+  if (cfg.mode === 'named') {
+    if (cfg.hostname) tunnelRuntime.url = `https://${cfg.hostname}`
+    if (registered) tunnelRuntime.status = 'running'
+    return
+  }
+  const match = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i.exec(text)
+  if (match) tunnelRuntime.url = match[0]
+  // URL 先于连接注册打印；只有真正注册成功才算 running，避免把被网络拦住的隧道显示成可用。
+  if (registered) tunnelRuntime.status = 'running'
+}
+
+function tunnelWritePid(pid) {
+  try {
+    fs.mkdirSync(path.dirname(TUNNEL_PID_FILE), { recursive: true, mode: 0o700 })
+    fs.writeFileSync(TUNNEL_PID_FILE, String(pid) + '\n', { mode: 0o600 })
+  } catch {}
+}
+
+function tunnelClearPid() {
+  try { fs.unlinkSync(TUNNEL_PID_FILE) } catch {}
+}
+
+/** 确认 pid 真的是 cloudflared，避免 pid 复用后误杀无关进程。 */
+function tunnelPidLooksLikeCloudflared(pid) {
+  try {
+    if (process.platform === 'win32') {
+      const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8', windowsHide: true, timeout: 3000 })
+      return /cloudflared/i.test(out)
+    }
+    if (process.platform === 'linux') return /cloudflared/i.test(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'))
+    const out = execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 3000 })
+    return /cloudflared/i.test(out)
+  } catch {
+    return false
+  }
+}
+
+/** 上次被强杀的网关可能留下孤儿 cloudflared；启动前按 pid 文件清理。 */
+function tunnelKillStale() {
+  try {
+    const pid = Number(fs.readFileSync(TUNNEL_PID_FILE, 'utf8').trim())
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return
+    if (!tunnelPidLooksLikeCloudflared(pid)) return
+    try {
+      process.kill(pid)
+      tunnelAppend('[tunnel] 已清理上次遗留的 cloudflared（pid ' + pid + '）')
+    } catch {}
+  } catch {}
+}
+
+function tunnelScheduleRestart() {
+  const cfg = loadTunnelConfig()
+  if (!cfg.enabled || tunnelRuntime.stopping) return
+  const now = Date.now()
+  tunnelRuntime.attempts = tunnelRuntime.attempts.filter(at => now - at < TUNNEL_RESTART_WINDOW_MS)
+  if (tunnelRuntime.attempts.length >= TUNNEL_RESTART_LIMIT) {
+    tunnelRuntime.status = 'error'
+    tunnelRuntime.lastError = 'cloudflared 连续退出，已停止自动重试'
+    tunnelAppend('[tunnel] ' + tunnelRuntime.lastError)
+    return
+  }
+  tunnelRuntime.attempts.push(now)
+  tunnelRuntime.restartCount++
+  const delay = Math.min(30000, 1000 * 2 ** (tunnelRuntime.attempts.length - 1))
+  tunnelAppend(`[tunnel] ${Math.round(delay / 1000)} 秒后重启（第 ${tunnelRuntime.attempts.length} 次）`)
+  tunnelRuntime.restartTimer = setTimeout(() => {
+    tunnelRuntime.restartTimer = null
+    startTunnel()
+  }, delay)
+  tunnelRuntime.restartTimer.unref?.()
+}
+
+function startTunnel() {
+  const cfg = loadTunnelConfig()
+  tunnelRuntime.config = cfg
+  if (!cfg.enabled) {
+    tunnelRuntime.status = 'stopped'
+    return { ok: true, enabled: false }
+  }
+  if (tunnelRuntime.child) return { ok: true, already: true }
+  const binary = tunnelBinary(cfg)
+  const unusable = tunnelBinaryUsable(binary)
+  if (unusable) {
+    tunnelRuntime.status = 'error'
+    tunnelRuntime.lastError = unusable
+    tunnelAppend('[tunnel] ' + unusable, 'stderr')
+    return { ok: false, error: unusable }
+  }
+  let args
+  try {
+    args = tunnelArgs(cfg)
+  } catch (error) {
+    tunnelRuntime.status = 'error'
+    tunnelRuntime.lastError = error.message
+    tunnelAppend('[tunnel] ' + error.message, 'stderr')
+    return { ok: false, error: error.message }
+  }
+  try { fs.mkdirSync(path.dirname(TUNNEL_CONFIG_FILE), { recursive: true, mode: 0o700 }) } catch {}
+  tunnelKillStale()
+  tunnelRuntime.stopping = false
+  tunnelRuntime.status = 'starting'
+  tunnelRuntime.lastError = ''
+  tunnelRuntime.url = cfg.mode === 'named' && cfg.hostname ? `https://${cfg.hostname}` : ''
+  tunnelRuntime.startedAt = Date.now()
+  tunnelAppend('[tunnel] 启动: ' + binary + ' ' + tunnelRedactedArgs(args, cfg).join(' '))
+  let child
+  try {
+    child = spawn(binary, args, {
+      cwd: path.dirname(TUNNEL_CONFIG_FILE),
+      env: { ...process.env, NO_COLOR: '1', FORCE_COLOR: '0' },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    tunnelRuntime.status = 'error'
+    tunnelRuntime.lastError = error.message
+    tunnelAppend('[tunnel] 启动失败: ' + error.message, 'stderr')
+    return { ok: false, error: error.message }
+  }
+  tunnelRuntime.child = child
+  if (child.pid) tunnelWritePid(child.pid)
+  const pipe = (stream, name) => {
+    if (!stream) return
+    stream.setEncoding('utf8')
+    let buffered = ''
+    stream.on('data', chunk => {
+      buffered += chunk
+      let index
+      while ((index = buffered.indexOf('\n')) >= 0) {
+        tunnelAppend(buffered.slice(0, index), name)
+        buffered = buffered.slice(index + 1)
+      }
+      if (buffered.length > 8192) {
+        tunnelAppend(buffered, name)
+        buffered = ''
+      }
+    })
+    stream.on('end', () => { if (buffered) tunnelAppend(buffered, name) })
+  }
+  pipe(child.stdout, 'stdout')
+  pipe(child.stderr, 'stderr')
+  child.once('error', error => {
+    tunnelRuntime.lastError = error.message
+    tunnelAppend('[tunnel] ' + error.message, 'stderr')
+  })
+  child.once('exit', (code, signal) => {
+    tunnelRuntime.child = null
+    tunnelClearPid()
+    if (tunnelRuntime.stopping) {
+      tunnelRuntime.status = 'stopped'
+      return
+    }
+    if (code === 0) {
+      tunnelRuntime.status = 'stopped'
+      tunnelAppend('[tunnel] cloudflared 已退出')
+      return
+    }
+    tunnelRuntime.status = 'error'
+    tunnelRuntime.lastError = `cloudflared 退出（code=${code ?? 'null'}${signal ? '，signal=' + signal : ''}）`
+    tunnelAppend('[tunnel] ' + tunnelRuntime.lastError, 'stderr')
+    tunnelScheduleRestart()
+  })
+  return { ok: true, starting: true }
+}
+
+function stopTunnel(reason = 'stop') {
+  const cfg = loadTunnelConfig()
+  tunnelRuntime.stopping = true
+  if (tunnelRuntime.restartTimer) {
+    clearTimeout(tunnelRuntime.restartTimer)
+    tunnelRuntime.restartTimer = null
+  }
+  const child = tunnelRuntime.child
+  if (!child) {
+    tunnelRuntime.stopping = false
+    tunnelRuntime.status = cfg.enabled ? 'stopped' : 'stopped'
+    tunnelClearPid()
+    return Promise.resolve({ ok: true })
+  }
+  return new Promise(resolve => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(killTimer)
+      tunnelRuntime.child = null
+      tunnelRuntime.status = 'stopped'
+      tunnelRuntime.stopping = false
+      tunnelClearPid()
+      tunnelAppend('[tunnel] 已停止（' + reason + '）')
+      resolve({ ok: true })
+    }
+    const killTimer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch {}
+      finish()
+    }, 4000)
+    killTimer.unref?.()
+    child.once('exit', finish)
+    try { child.kill('SIGTERM') } catch { finish() }
+  })
+}
+
+async function restartTunnel() {
+  await stopTunnel('restart')
+  tunnelRuntime.attempts = []
+  return startTunnel()
+}
+
+function tunnelSummary(includeLogs = false, lines = 200) {
+  const cfg = tunnelRuntime.config || loadTunnelConfig()
+  const payload = {
+    ok: true,
+    enabled: !!cfg.enabled,
+    mode: cfg.mode,
+    status: tunnelRuntime.status,
+    url: tunnelRuntime.url || (cfg.mode === 'named' && cfg.hostname ? `https://${cfg.hostname}` : ''),
+    hostname: cfg.hostname,
+    tunnel: cfg.tunnel,
+    protocol: cfg.protocol,
+    binary: tunnelBinary(cfg),
+    pid: tunnelRuntime.child?.pid || 0,
+    startedAt: tunnelRuntime.startedAt,
+    restartCount: tunnelRuntime.restartCount,
+    lastError: tunnelRuntime.lastError,
+    hasToken: !!cfg.token,
+    extraArgs: cfg.extraArgs,
+    logFile: TUNNEL_LOG_FILE,
+    logSeq: tunnelRuntime.seq,
+  }
+  if (includeLogs) payload.logs = tunnelRuntime.logs.slice(-Math.max(1, lines))
+  return payload
+}
+
+async function serveTunnelApi(req, res, url, sub) {
+  if (!adminAuthorized(req, url)) {
+    authFailures++
+    touchDevice(req, { failedAuth: true })
+    return fsJson(res, 401, { error: 'unauthorized' })
+  }
+  if (sub === '/tunnel' && req.method === 'GET') {
+    const lines = Math.min(1000, Math.max(20, Number(url.searchParams.get('lines')) || 200))
+    return fsJson(res, 200, tunnelSummary(true, lines))
+  }
+  if (sub === '/tunnel/log' && req.method === 'GET') {
+    const since = Number(url.searchParams.get('since')) || 0
+    return fsJson(res, 200, { ok: true, seq: tunnelRuntime.seq, logs: tunnelRuntime.logs.filter(row => row.n > since) })
+  }
+  if (sub === '/tunnel/config' && req.method === 'POST') {
+    let input
+    try {
+      input = JSON.parse(await readBody(req, 16 * 1024))
+    } catch {
+      return fsJson(res, 400, { error: 'bad-request' })
+    }
+    let cfg
+    try {
+      cfg = normalizeTunnelConfig(input, loadTunnelConfig())
+    } catch (error) {
+      return fsJson(res, error.status || 400, { error: error.code || 'bad-request', detail: error.message })
+    }
+    try {
+      saveTunnelConfig(cfg)
+    } catch (error) {
+      return fsJson(res, 500, { error: 'write-failed', detail: error.message })
+    }
+    tunnelRuntime.config = cfg
+    if (!cfg.enabled) {
+      await stopTunnel('config')
+      return fsJson(res, 200, tunnelSummary(false))
+    }
+    if (tunnelRuntime.child) await stopTunnel('config')
+    tunnelRuntime.attempts = []
+    startTunnel()
+    touchDevice(req)
+    return fsJson(res, 200, tunnelSummary(false))
+  }
+  if (sub === '/tunnel/restart' && req.method === 'POST') {
+    const out = await restartTunnel()
+    touchDevice(req)
+    return fsJson(res, out.ok ? 200 : 500, { ...tunnelSummary(false), error: out.ok ? undefined : out.error })
+  }
+  return fsJson(res, 404, { error: 'not-found' })
+}
+
 /** 读取插件兑换的新版 DSH 会话 Cookie；动态读取允许 DSH 重启后原地刷新。 */
 function dshUpstreamCookie() {
   try {
@@ -993,7 +1427,7 @@ function dshUpstreamHeaders(base = {}) {
 
 // 更新检查: GitHub 为默认源, 可用环境变量覆盖(国内镜像 / 代理)
 const UPDATE_CHECK_URL = process.env.UPDATE_CHECK_URL ||
-  'https://api.github.com/repos/Blank-not-black/dsh-Remote/releases/latest'
+  'https://api.github.com/repos/ccialo/dsh-remote/releases/latest'
 const UPDATE_INTERVAL_MS = Number(process.env.UPDATE_INTERVAL_MS) || 6 * 3600 * 1000
 const latestState = { version: null, url: null, tag: null, checkedAt: 0, error: '' }
 
@@ -1054,11 +1488,14 @@ const ADVERTISED_HOSTS = configuredAdvertisedHosts()
 const DSH_CONTROL_SUPPORT = dshControlSupport()
 const VERSION = gatewayVersion()
 const PROTOCOL_VERSION = 1
+// 兼容开关：~/.dsh-remote/disable-operations 存在时不再声明 operations。
+// 部分客户端/网络下 /api/operations 回执通道会超时；关闭后客户端自动退回直连 RPC。
+const OPERATIONS_ENABLED = !fs.existsSync(path.join(os.homedir(), '.dsh-remote', 'disable-operations'))
 const CAPABILITIES = Object.freeze({
   wsTicket: 1,
   eventPolling: 1,
   eventEpoch: 1,
-  operations: 1,
+  operations: OPERATIONS_ENABLED ? 1 : 0,
   cloudRelay: 1,
   workspaceFiles: 2,
   imagePromptTransport: 1,
@@ -4507,6 +4944,7 @@ function upstreamReachable(cb) {
 
 async function serveAdminApi(req, res, url) {
   const sub = url.pathname.slice('/admin/api'.length) || '/'
+  if (sub === '/tunnel' || sub.startsWith('/tunnel/')) return serveTunnelApi(req, res, url, sub)
   if (sub === '/autostart') {
     const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }); res.end(JSON.stringify(value)) }
     if (!adminAuthorized(req, url)) return reply(401, { error: 'unauthorized' })
@@ -4567,6 +5005,7 @@ async function serveAdminApi(req, res, url) {
         deviceCount: devices.size,
         onlineCount: [...devices.values()].filter(d => Date.now() - d.lastSeen < 60_000).length,
         events: eventCollectorState,
+        tunnel: tunnelSummary(false),
         devices: deviceViews()
       }))
     })
@@ -4689,9 +5128,11 @@ async function serveAdminApi(req, res, url) {
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
     res.end(JSON.stringify({ ok: true, bye: true }))
     // 给响应留出发送时间, 然后退出; 由插件/系统按需再拉起
-    setTimeout(() => {
+    setTimeout(async () => {
       recordCrash('gateway','manual-stop')
       console.log('[shutdown] 收到管理端停止指令, 网关退出')
+      // 网关停止 = 隧道停止: 先收掉 cloudflared 再退出, 最多等 2.5 秒
+      try { await Promise.race([stopTunnel('shutdown'), new Promise(resolve => setTimeout(resolve, 2500))]) } catch {}
       process.exit(0)
     }, 150)
     return
@@ -6952,9 +7393,25 @@ server.on('clientError', (err, socket) => {
   if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
 })
 
+// 网关被 Ctrl+C / SIGTERM 停止时, 一并收掉隧道子进程
+let tunnelShuttingDown = false
+function tunnelShutdownAndExit(code = 0) {
+  if (tunnelShuttingDown) return
+  tunnelShuttingDown = true
+  const done = () => { try { process.exit(code) } catch {} }
+  Promise.race([stopTunnel('signal'), new Promise(resolve => setTimeout(resolve, 2500))]).then(done, done)
+  const force = setTimeout(done, 3000)
+  force.unref?.()
+}
+process.once('SIGINT', () => tunnelShutdownAndExit(0))
+process.once('SIGTERM', () => tunnelShutdownAndExit(0))
+process.once('exit', () => { try { tunnelRuntime.child?.kill() } catch {} })
+
 server.listen(PORT, HOST, () => {
   restoreDshControl()
   relayHost.startSaved()
+  // 网关起来 = 隧道跟着起（tunnel.json 里 enabled=true 时）
+  startTunnel()
   void loginAutostart.refresh().catch(() => { console.error('[autostart] refresh failed; reopen login startup settings') })
   void refreshHealthProbe()
   void dshControlDescription()

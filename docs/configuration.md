@@ -49,6 +49,49 @@ node gateway.js --supervise
 
 插件内嵌管理页处于 DSH 登录边界内，不用 Remote Bearer 覆盖浏览器 Basic Auth；独立 `/admin/api/*` 使用主令牌。设备令牌只允许指定控制接口，不能读取管理页中的主令牌与其他设备密钥。
 
+## Cloudflare 隧道
+
+网关内置一个可选的 `cloudflared` 监管器：**启动网关时自动拉起隧道，停止网关时一并关闭**。cloudflared 始终是网关的子进程，不注册 Windows 服务，因此日志既能实时显示在管理页，也能直接读文件。配置由管理页「Cloudflare 隧道」卡片维护，保存在 `~/.dsh-remote/tunnel.json`，网关启动时读取。
+
+| 配置 | 默认/作用 |
+| --- | --- |
+| `enabled` | `false`；为 `true` 时网关监听成功后自动启动隧道 |
+| `mode` | `quick` 临时隧道（`*.trycloudflare.com`，每次启动换地址）；`named` 命名隧道（固定域名） |
+| `hostname` | 命名隧道的公网主机名，如 `dsh.example.com`，同时用于生成配对二维码 |
+| `tunnel` | `cloudflared tunnel create` 的隧道名，与 `token` 二选一 |
+| `token` | 命名隧道 Token（Cloudflare Zero Trust 面板生成）；填写后走 `cloudflared tunnel run --token`，不需要本机证书 |
+| `binary` | cloudflared 可执行文件；留空时依次使用 `DSH_REMOTE_TUNNEL_BIN`、`CLOUDFLARED`、`PATH` |
+| `protocol` | `auto` / `http2` / `quic`；校园网等拦截 QUIC 的环境可改为 `http2` |
+| `extraArgs` | 追加在 `tunnel` 子命令前的参数数组，最多 20 项 |
+
+| 环境变量 | 作用 |
+| --- | --- |
+| `DSH_REMOTE_TUNNEL_CONFIG` | 覆盖配置文件路径 |
+| `DSH_REMOTE_TUNNEL_LOG` | 覆盖日志文件路径，默认 `~/.dsh-remote/cloudflared.log` |
+| `DSH_REMOTE_TUNNEL_BIN` | 覆盖 cloudflared 可执行文件 |
+
+行为约定：
+
+- 启动失败（找不到 cloudflared、参数错误）只把隧道状态置为 `error`，不影响网关本身；管理页会显示原因。
+- 非正常退出会在 5 分钟窗口内最多自动重启 5 次（1s/2s/4s/8s/16s 退避），超过后停在 `error`。
+- 网关收到管理端停止、SIGINT/SIGTERM 或正常退出时先终止 cloudflared；被强制杀死时可能留下孤儿进程，下次启动会按 `~/.dsh-remote/cloudflared.pid` 校验进程名后清理。
+- 管理页提供「隧道地址」「二维码」与实时日志；二维码内容为 `dshremote://pair?token=…&server=https://<hostname>`，命名隧道的固定域名可以直接复用。
+- 隧道只改变入口，不改变鉴权：仍然需要 Bearer 令牌或设备密钥；把 8787 暴露到公网前建议开启独立设备密钥，并在 Cloudflare 侧加访问限制。
+
+命名隧道配置示例（在 Cloudflare 面板创建隧道后拿到 Token）：
+
+```json
+{
+  "enabled": true,
+  "mode": "named",
+  "hostname": "dsh.example.com",
+  "token": "<tunnel-token>",
+  "binary": "C:\\path\\to\\cloudflared.exe",
+  "protocol": "auto",
+  "extraArgs": []
+}
+```
+
 ## 文件访问
 
 | 配置 | 默认/作用 |

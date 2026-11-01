@@ -41,14 +41,14 @@
     "mobile"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/Blank-not-black/dsh-Remote",
+  "homepage": "https://github.com/ccialo/dsh-remote",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Blank-not-black/dsh-Remote.git",
+    "url": "git+https://github.com/ccialo/dsh-remote.git",
     "directory": "packages/plugin"
   },
   "bugs": {
-    "url": "https://github.com/Blank-not-black/dsh-Remote/issues"
+    "url": "https://github.com/ccialo/dsh-remote/issues"
   },
   "publishConfig": {
     "access": "public"

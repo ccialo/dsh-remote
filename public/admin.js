@@ -487,6 +487,7 @@ function render(st) {
   renderDeviceKeys(st, isGateway)
   renderHostIPs(st)
   renderQr(st)
+  renderTunnel(st)
   renderDoctor(st)
   // 网关开关: 仅插件内嵌页提供, 网关运行/停止两种状态
   gatewayRunning = isGateway || st.gatewayRunning === true
@@ -622,6 +623,175 @@ function renderQr(st) {
     $('pair-qr').textContent = t('pair.failed')
     box.classList.remove('hidden')
   }
+}
+
+// ---------- Cloudflare 隧道 ----------
+let tunnelInfo = null
+let tunnelLogs = []
+let tunnelPollTimer = null
+let tunnelBusy = false
+let tunnelQrShown = false
+
+function tunnelStatusText(info) {
+  const state = info?.status === 'running' ? 'running' : info?.status === 'starting' ? 'starting' : info?.status === 'error' ? 'error' : 'stopped'
+  return t('tunnel.status.' + state)
+}
+
+function renderTunnelConfig(info) {
+  if (!info) return
+  const config = $('tunnel-config')
+  if (config && config.contains(document.activeElement)) return
+  $('tunnel-mode').value = info.mode === 'named' ? 'named' : 'quick'
+  $('tunnel-hostname').value = info.hostname || ''
+  $('tunnel-name').value = info.tunnel || ''
+  $('tunnel-protocol').value = info.protocol || 'auto'
+  $('tunnel-binary').value = info.binary && info.binary !== 'cloudflared' ? info.binary : ''
+  $('tunnel-token').placeholder = info.hasToken ? t('tunnel.tokenHint') : '••••••'
+  $('tunnel-config-hint').textContent = info.lastError || ''
+}
+
+function renderTunnelQr() {
+  const box = $('tunnel-qr-box')
+  if (!box) return
+  if (!tunnelQrShown || !tunnelInfo?.url || !shownToken) {
+    box.classList.add('hidden')
+    return
+  }
+  try {
+    const query = new URLSearchParams({ token: shownToken })
+    query.append('server', tunnelInfo.url)
+    const qr = window.qrcode(0, 'M')
+    qr.addData(`dshremote://pair?${query.toString()}`)
+    qr.make()
+    $('tunnel-qr').innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true })
+    $('tunnel-qr-hint').textContent = t('tunnel.qrHint', { base: tunnelInfo.url })
+    box.classList.remove('hidden')
+  } catch {
+    $('tunnel-qr').textContent = t('tunnel.qrFailed')
+    box.classList.remove('hidden')
+  }
+}
+
+function paintTunnelLog() {
+  const pre = $('tunnel-log')
+  if (!pre) return
+  const paused = $('tunnel-log-pause')?.checked
+  if (paused) return
+  const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 12
+  pre.textContent = tunnelLogs
+    .map(row => `[${new Date(row.t).toLocaleTimeString()}] ${row.stream === 'stderr' ? '! ' : ''}${row.text}`)
+    .join('\n')
+  if (atBottom) pre.scrollTop = pre.scrollHeight
+}
+
+function renderTunnel(st) {
+  const card = $('tunnel-card')
+  if (!card) return
+  const available = !!st && (st.mode === 'gateway' || st.gatewayRunning === true)
+  card.classList.toggle('hidden', !available)
+  if (!available) return
+  if (st.tunnel) tunnelInfo = { ...tunnelInfo, ...st.tunnel }
+  if (!tunnelInfo) return
+  const enabled = tunnelInfo.enabled === true
+  $('tunnel-badge').textContent = enabled ? t('tunnel.enabled') : t('tunnel.disabled')
+  $('tunnel-badge').className = 'badge ' + (enabled ? 'on' : '')
+  $('btn-tunnel-toggle').textContent = enabled ? t('tunnel.disable') : t('tunnel.enable')
+  $('btn-tunnel-toggle').disabled = tunnelBusy
+  $('btn-tunnel-restart').disabled = tunnelBusy || !enabled
+  const mode = t('tunnel.mode.' + (tunnelInfo.mode === 'named' ? 'named' : 'quick'))
+  let summary = t('tunnel.summary', { status: tunnelStatusText(tunnelInfo), mode, n: tunnelInfo.restartCount || 0 })
+  if (tunnelInfo.lastError) summary += ' · ' + tunnelInfo.lastError
+  $('tunnel-summary').textContent = summary
+  const url = tunnelInfo.url || ''
+  $('tunnel-url-row').classList.toggle('hidden', !url)
+  $('tunnel-url').textContent = url || t('tunnel.noUrl')
+  renderTunnelConfig(tunnelInfo)
+  renderTunnelQr()
+  paintTunnelLog()
+  if (!tunnelPollTimer) {
+    tunnelPollTimer = setInterval(() => { if (!document.hidden) loadTunnel() }, 2000)
+    loadTunnel()
+  }
+}
+
+async function loadTunnel() {
+  if (!lastState || lastState.mode !== 'gateway') return
+  if (tunnelBusy) return
+  try {
+    const res = await fetch(`${API}/tunnel?lines=300`, {
+      headers: adminHeaders(),
+      credentials: 'same-origin',
+      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(8000) : undefined,
+    })
+    if (!res.ok) return
+    const info = await res.json()
+    if (!info || info.ok !== true) return
+    tunnelInfo = { ...tunnelInfo, ...info }
+    if (Array.isArray(info.logs)) tunnelLogs = info.logs
+    if (lastState) lastState.tunnel = info
+    renderTunnel(lastState)
+  } catch {}
+}
+
+async function saveTunnelConfig(patch) {
+  if (tunnelBusy) return
+  tunnelBusy = true
+  renderTunnel(lastState)
+  try {
+    const res = await fetch(`${API}/tunnel/config`, {
+      method: 'POST',
+      headers: adminHeaders({ 'content-type': 'application/json' }),
+      credentials: 'same-origin',
+      body: JSON.stringify(patch),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.detail || data.error || ('HTTP ' + res.status))
+    tunnelInfo = { ...tunnelInfo, ...data }
+    tunnelQrShown = false
+    toast(t('tunnel.saved'), 'ok')
+  } catch (error) {
+    toast(t('tunnel.failed', { msg: error.message }), 'err')
+  } finally {
+    tunnelBusy = false
+    renderTunnel(lastState)
+    await loadTunnel()
+  }
+}
+
+async function restartTunnelAction() {
+  if (tunnelBusy) return
+  tunnelBusy = true
+  renderTunnel(lastState)
+  try {
+    const res = await fetch(`${API}/tunnel/restart`, {
+      method: 'POST',
+      headers: adminHeaders(),
+      credentials: 'same-origin',
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.detail || data.error || ('HTTP ' + res.status))
+    tunnelQrShown = false
+    toast(t('tunnel.saved'), 'ok')
+  } catch (error) {
+    toast(t('tunnel.failed', { msg: error.message }), 'err')
+  } finally {
+    tunnelBusy = false
+    renderTunnel(lastState)
+    await loadTunnel()
+  }
+}
+
+function collectTunnelConfig() {
+  const patch = {
+    mode: $('tunnel-mode').value,
+    hostname: $('tunnel-hostname').value.trim(),
+    tunnel: $('tunnel-name').value.trim(),
+    binary: $('tunnel-binary').value.trim(),
+    protocol: $('tunnel-protocol').value,
+  }
+  const entry = $('tunnel-token').value.trim()
+  if (entry) patch.token = entry
+  return patch
 }
 
 async function setNote(ip, current) {
@@ -874,6 +1044,31 @@ $('btn-qr').addEventListener('click', () => {
   qrLabel = ''
   qrShown = !qrShown
   renderQr(lastState || { mode: '', token: shownToken })
+})
+
+$('btn-tunnel-toggle').addEventListener('click', () => {
+  saveTunnelConfig({ enabled: !(tunnelInfo && tunnelInfo.enabled === true) })
+})
+$('btn-tunnel-restart').addEventListener('click', restartTunnelAction)
+$('btn-tunnel-save').addEventListener('click', () => saveTunnelConfig(collectTunnelConfig()))
+$('btn-tunnel-copy').addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(tunnelInfo?.url || '')
+    toast(t('tunnel.copied'), 'ok')
+  } catch {
+    toast(t('toast.copyFailed'), 'err')
+  }
+})
+$('btn-tunnel-qr').addEventListener('click', () => {
+  tunnelQrShown = !tunnelQrShown
+  renderTunnelQr()
+})
+$('btn-tunnel-log-clear').addEventListener('click', () => {
+  tunnelLogs = []
+  $('tunnel-log').textContent = ''
+})
+$('tunnel-log-pause').addEventListener('change', () => {
+  if (!$('tunnel-log-pause').checked) paintTunnelLog()
 })
 
 $('btn-host-ip-add').addEventListener('click', addManualHostIP)

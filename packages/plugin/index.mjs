@@ -879,6 +879,7 @@ async function serveStatic(req, res, ctx) {
         mux: { connected: false, attempt: 0, lastError: '网关未运行' },
         host: { connected: false, attempt: 0, lastError: '网关未运行' },
       },
+      tunnel: { ok: true, enabled: false, mode: 'quick', status: 'stopped', url: '', logs: [] },
       devices: [],
     })
     return
@@ -893,6 +894,17 @@ async function serveStatic(req, res, ctx) {
     [`${MOUNT}/admin/api/device-keys/rotate`, '/device-keys/rotate'],
     [`${MOUNT}/admin/api/device-keys/revoke`, '/device-keys/revoke'],
   ])
+  // Cloudflare 隧道: 状态/日志与配置都归网关所有, 插件只做透传
+  if (pathname === `${MOUNT}/admin/api/tunnel` || pathname.startsWith(`${MOUNT}/admin/api/tunnel/`)) {
+    if (!['GET', 'POST'].includes(req.method)) { res.writeHead(405, { allow: 'GET, POST' }); res.end(); return }
+    const query = new URL(req.url ?? '/', 'http://x').search
+    const sub = pathname.slice(`${MOUNT}/admin/api`.length)
+    const body = req.method === 'POST' ? await readBody(req, 16 * 1024) : undefined
+    const proxied = await proxyGateway(`/admin/api${sub}${query}`, req.method, body)
+    if (proxied !== null) sendJson(res, proxied.status, proxied.json)
+    else sendJson(res, 502, { ok: false, error: '本地网关不可用，隧道需要网关运行' })
+    return
+  }
   if (pathname === `${MOUNT}/admin/api/relay` || pathname === `${MOUNT}/admin/api/autostart`) {
     if (!['GET', 'POST'].includes(req.method)) { res.writeHead(405, { allow: 'GET, POST' }); res.end(); return }
     const body = req.method === 'POST' ? await readBody(req, 4096) : undefined

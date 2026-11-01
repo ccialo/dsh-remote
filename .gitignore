@@ -16,6 +16,8 @@ android/build/
 .npm-cache/
 SHA256SUMS-rc.txt
 packages/plugin/*.tgz
+# 本地 cloudflared 二进制（体积大，不随仓库分发）
+tools/cloudflared*.exe
 harmonyos/local.properties
 
 # Relay runtime credentials and ledgers. Public loopback TLS fixtures stay visible.

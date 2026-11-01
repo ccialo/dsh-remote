@@ -340,6 +340,22 @@
       .admin-title h1 { display: block; min-width: 0; overflow: visible; font-size: 18px; }
       .admin-title .left { gap: 7px; }
     }
+    .tunnel-card { background: linear-gradient(145deg, var(--dsr-panel), var(--dsr-bg-2)); border: 1px solid var(--dsr-line); border-radius: 18px; padding: 16px; margin-bottom: 14px; }
+    .tunnel-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+    .tunnel-title { font-weight: 700; font-size: 15px; }
+    .tunnel-head-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .tunnel-desc { margin: 8px 0 10px; font-size: 12px; }
+    .tunnel-url-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+    .tunnel-url-row code { flex: 1; min-width: 220px; padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,.22); border: 1px solid var(--dsr-line); overflow-wrap: anywhere; }
+    .tunnel-config { margin: 8px 0; }
+    .tunnel-config summary { cursor: pointer; font-size: 13px; color: var(--dsr-muted); }
+    .tunnel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0; }
+    .tunnel-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--dsr-muted); }
+    .tunnel-grid input, .tunnel-grid select { padding: 7px 9px; border-radius: 9px; border: 1px solid var(--dsr-line); background: rgba(0,0,0,.18); color: inherit; font-size: 13px; }
+    .tunnel-config-actions { display: flex; justify-content: flex-end; gap: 10px; align-items: center; }
+    .tunnel-log-head { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 10px; font-size: 12px; color: var(--dsr-muted); }
+    .tunnel-log-pause { display: flex; gap: 5px; align-items: center; }
+    .tunnel-log { margin: 8px 0 0; max-height: 240px; overflow: auto; padding: 10px; border-radius: 10px; border: 1px solid var(--dsr-line); background: rgba(0,0,0,.35); font: 11px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
   </style>
   <link rel="stylesheet" href="../remote-ui.css">
 </head>
@@ -502,6 +518,65 @@
           </table>
           <div id="host-ip-empty" class="host-ip-empty hidden" data-i18n="hostIPs.empty">暂无可用的非回环地址</div>
         </div>
+      </section>
+
+      <section id="tunnel-card" class="tunnel-card hidden" aria-live="polite">
+        <div class="tunnel-head">
+          <div class="tunnel-head-copy">
+            <div class="tunnel-title" data-i18n="tunnel.title">Cloudflare 隧道</div>
+            <div id="tunnel-summary" class="muted" data-i18n="tunnel.loading">正在读取隧道状态…</div>
+          </div>
+          <div class="tunnel-head-actions">
+            <span id="tunnel-badge" class="badge">—</span>
+            <button id="btn-tunnel-toggle" class="mini-btn" type="button" data-i18n="tunnel.enable">启用隧道</button>
+            <button id="btn-tunnel-restart" class="mini-btn" type="button" data-i18n="tunnel.restart">重启隧道</button>
+          </div>
+        </div>
+        <div class="tunnel-desc muted" data-i18n="tunnel.desc">随网关启停：启动网关时自动拉起 cloudflared，停止网关时一并关闭，日志实时显示在下方。</div>
+        <div id="tunnel-url-row" class="tunnel-url-row hidden">
+          <code id="tunnel-url">—</code>
+          <button id="btn-tunnel-copy" class="mini-btn" type="button" data-i18n="tunnel.copy">复制地址</button>
+          <button id="btn-tunnel-qr" class="mini-btn" type="button" data-i18n="tunnel.qr">二维码</button>
+        </div>
+        <div id="tunnel-qr-box" class="pair-box hidden">
+          <div class="pair-title" data-i18n="tunnel.qrTitle">隧道扫码配对</div>
+          <div class="pair-qr" id="tunnel-qr"></div>
+          <div class="muted" id="tunnel-qr-hint"></div>
+        </div>
+        <details id="tunnel-config" class="tunnel-config">
+          <summary data-i18n="tunnel.config">隧道配置</summary>
+          <div class="tunnel-grid">
+            <label><span data-i18n="tunnel.mode">模式</span>
+              <select id="tunnel-mode">
+                <option value="quick" data-i18n="tunnel.mode.quick">临时隧道（trycloudflare，重启换地址）</option>
+                <option value="named" data-i18n="tunnel.mode.named">命名隧道（固定域名）</option>
+              </select>
+            </label>
+            <label><span data-i18n="tunnel.hostname">公网主机名</span><input id="tunnel-hostname" placeholder="dsh.xinghui.asia" autocomplete="off"></label>
+            <label><span data-i18n="tunnel.name">隧道名</span><input id="tunnel-name" placeholder="dsh" autocomplete="off"></label>
+            <label><span data-i18n="tunnel.token">隧道 Token</span><input id="tunnel-token" type="password" placeholder="••••••" autocomplete="off"></label>
+            <label><span data-i18n="tunnel.binary">cloudflared 路径</span><input id="tunnel-binary" placeholder="cloudflared" autocomplete="off"></label>
+            <label><span data-i18n="tunnel.protocol">连接协议</span>
+              <select id="tunnel-protocol">
+                <option value="auto">auto</option>
+                <option value="http2">http2</option>
+                <option value="quic">quic</option>
+              </select>
+            </label>
+          </div>
+          <div class="tunnel-config-actions">
+            <span id="tunnel-config-hint" class="muted"></span>
+            <button id="btn-tunnel-save" class="mini-btn" type="button" data-i18n="tunnel.save">保存配置</button>
+          </div>
+        </details>
+        <div class="tunnel-log-head">
+          <span data-i18n="tunnel.log">隧道日志</span>
+          <span class="tunnel-log-tools">
+            <label class="tunnel-log-pause"><input type="checkbox" id="tunnel-log-pause"> <span data-i18n="tunnel.pause">暂停滚动</span></label>
+            <button id="btn-tunnel-log-clear" class="mini-btn" type="button" data-i18n="tunnel.clear">清空显示</button>
+          </span>
+        </div>
+        <pre id="tunnel-log" class="tunnel-log" aria-live="off"></pre>
       </section>
 
       <div id="pair-box" class="pair-box hidden">
@@ -673,6 +748,22 @@
         'toast.opFailedMsg': '操作失败：{msg}',
         'pair.hint': '{base} · App「设置 → 扫码连接」，或系统相机扫一扫自动打开 App',
         'pair.failed': '二维码生成失败',
+        'tunnel.title': 'Cloudflare 隧道',
+        'tunnel.desc': '随网关启停：启动网关时自动拉起 cloudflared，停止网关时一并关闭；日志实时显示，不注册 Windows 服务。',
+        'tunnel.loading': '正在读取隧道状态…',
+        'tunnel.enable': '启用隧道', 'tunnel.disable': '停用隧道', 'tunnel.restart': '重启隧道',
+        'tunnel.enabled': '已启用', 'tunnel.disabled': '未启用',
+        'tunnel.status.stopped': '已停止', 'tunnel.status.starting': '启动中', 'tunnel.status.running': '运行中', 'tunnel.status.error': '异常',
+        'tunnel.url': '隧道地址', 'tunnel.copy': '复制地址', 'tunnel.copied': '地址已复制', 'tunnel.qr': '二维码',
+        'tunnel.qrTitle': '隧道扫码配对', 'tunnel.qrHint': '{base} · 手机 App 扫码连接', 'tunnel.qrFailed': '二维码生成失败',
+        'tunnel.config': '隧道配置', 'tunnel.mode': '模式', 'tunnel.mode.quick': '临时隧道（trycloudflare，重启换地址）', 'tunnel.mode.named': '命名隧道（固定域名）',
+        'tunnel.hostname': '公网主机名', 'tunnel.name': '隧道名', 'tunnel.token': '隧道 Token', 'tunnel.tokenHint': '留空表示不修改已保存的 Token',
+        'tunnel.binary': 'cloudflared 路径', 'tunnel.protocol': '连接协议',
+        'tunnel.save': '保存配置', 'tunnel.saved': '隧道配置已保存', 'tunnel.failed': '隧道操作失败：{msg}',
+        'tunnel.log': '隧道日志', 'tunnel.pause': '暂停滚动', 'tunnel.clear': '清空显示',
+        'tunnel.summary': '{status} · {mode} · 自动重启 {n} 次', 'tunnel.noUrl': '尚未生成隧道地址',
+        'tunnel.gatewayDown': '网关未运行，启动网关后隧道会自动开始',
+        'tunnel.needBinary': '未找到 cloudflared，请在配置里填写可执行文件路径',
         'login.title': 'DSH Remote 管理'
       },
       en: {
@@ -792,6 +883,22 @@
         'toast.opFailedMsg': 'Operation failed: {msg}',
         'pair.hint': '{base} · App "Settings → Scan to connect", or scan with the system camera to open the App',
         'pair.failed': 'QR generation failed',
+        'tunnel.title': 'Cloudflare tunnel',
+        'tunnel.desc': 'Follows the gateway lifecycle: cloudflared starts with the gateway and stops with it. Logs stay visible here; nothing is installed as a Windows service.',
+        'tunnel.loading': 'Reading tunnel status…',
+        'tunnel.enable': 'Enable tunnel', 'tunnel.disable': 'Disable tunnel', 'tunnel.restart': 'Restart tunnel',
+        'tunnel.enabled': 'Enabled', 'tunnel.disabled': 'Disabled',
+        'tunnel.status.stopped': 'Stopped', 'tunnel.status.starting': 'Starting', 'tunnel.status.running': 'Running', 'tunnel.status.error': 'Error',
+        'tunnel.url': 'Tunnel URL', 'tunnel.copy': 'Copy URL', 'tunnel.copied': 'URL copied', 'tunnel.qr': 'QR code',
+        'tunnel.qrTitle': 'Pair over the tunnel', 'tunnel.qrHint': '{base} · scan with the mobile App', 'tunnel.qrFailed': 'QR generation failed',
+        'tunnel.config': 'Tunnel configuration', 'tunnel.mode': 'Mode', 'tunnel.mode.quick': 'Quick tunnel (trycloudflare, new URL each start)', 'tunnel.mode.named': 'Named tunnel (fixed domain)',
+        'tunnel.hostname': 'Public hostname', 'tunnel.name': 'Tunnel name', 'tunnel.token': 'Tunnel token', 'tunnel.tokenHint': 'Leave blank to keep the saved token',
+        'tunnel.binary': 'cloudflared path', 'tunnel.protocol': 'Protocol',
+        'tunnel.save': 'Save configuration', 'tunnel.saved': 'Tunnel configuration saved', 'tunnel.failed': 'Tunnel operation failed: {msg}',
+        'tunnel.log': 'Tunnel log', 'tunnel.pause': 'Pause scrolling', 'tunnel.clear': 'Clear display',
+        'tunnel.summary': '{status} · {mode} · {n} auto-restarts', 'tunnel.noUrl': 'No tunnel URL yet',
+        'tunnel.gatewayDown': 'Gateway is not running; the tunnel starts with the gateway',
+        'tunnel.needBinary': 'cloudflared not found — set the executable path in the configuration',
         'login.title': 'DSH Remote Admin'
       }
     }
